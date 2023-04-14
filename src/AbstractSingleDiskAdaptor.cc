@@ -32,6 +32,10 @@
  * files in the program, then also delete it here.
  */
 /* copyright --> */
+#include <thread> // C++11
+#include <type_traits> // std::remove_reference_t , C++11
+// lambda, C++11
+
 #include "AbstractSingleDiskAdaptor.h"
 #include "File.h"
 #include "AdaptiveFileAllocationIterator.h"
@@ -96,11 +100,37 @@ ssize_t AbstractSingleDiskAdaptor::readDataDropCache(unsigned char* data,
 
 void AbstractSingleDiskAdaptor::writeCache(const WrDiskCacheEntry* entry)
 {
-  for (auto& d : entry->getDataSet()) {
-    A2_LOG_DEBUG(fmt("Cache flush goff=%" PRId64 ", len=%lu", d->goff,
-                     static_cast<unsigned long>(d->len)));
+  // MISTY HACK: do WrDiskCacheEntry::deleteDataCells() here
+  // MISTY HACK: Change AbstractDiskWriter::writeDataInternal from seek() + write() to pwrite() to avoid race-condition
+  // MISTY HACK: possible we can force use mmap
+  
+  auto &dataSet = const_cast<WrDiskCacheEntry::DataCellSet&>(entry->getDataSet());
+  WrDiskCacheEntry::DataCellSet copiedSet(dataSet);
+  dataSet.clear();
+
+  std::thread{[this, copiedSet] {
+  
+  if (copiedSet.empty()) {
+    return;
+  }
+
+  auto start_goff = (*copiedSet.begin())->goff;
+  A2_LOG_INFO(fmt("Cache async flush start... goff=%" PRId64, start_goff));
+
+  for (auto& d : copiedSet) {
+    A2_LOG_DEBUG(fmt("Cache async flush goff=%" PRId64 ", len=%lu", d->goff,
+                    static_cast<unsigned long>(d->len)));
     writeData(d->data + d->offset, d->len, d->goff);
   }
+  for (auto& d : copiedSet) {
+    delete[] d->data;
+    delete d;
+  }
+
+  A2_LOG_INFO(fmt("Cache async flush finish... goff=%" PRId64, start_goff));
+
+  }}.detach();
+  
 }
 
 void AbstractSingleDiskAdaptor::flushOSBuffers()

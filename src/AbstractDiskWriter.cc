@@ -130,6 +130,8 @@ void AbstractDiskWriter::openFile(int64_t totalLength)
 
 void AbstractDiskWriter::closeFile()
 {
+  A2_LOG_DEBUG(fmt("Closing file: %s", filename_.c_str()));
+  sleep(3);
 #if defined(HAVE_MMAP) || defined(__MINGW32__)
   if (mapaddr_) {
     int errNum = 0;
@@ -276,7 +278,7 @@ ssize_t AbstractDiskWriter::writeDataInternal(const unsigned char* data,
       }
 #else  // !__MINGW32__
       ssize_t ret = 0;
-      while ((ret = write(fd_, data + writtenLength, len - writtenLength)) ==
+      while ((ret = pwrite(fd_, data + writtenLength, len - writtenLength, offset + writtenLength)) ==
                  -1 &&
              errno == EINTR)
         ;
