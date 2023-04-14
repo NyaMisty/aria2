@@ -35,6 +35,10 @@
 #include <thread> // C++11
 #include <type_traits> // std::remove_reference_t , C++11
 // lambda, C++11
+#include <mutex> // for TempSem
+#include <condition_variable>
+#include <atomic>
+#include <cassert>
 
 #include "AbstractSingleDiskAdaptor.h"
 #include "File.h"
@@ -98,36 +102,105 @@ ssize_t AbstractSingleDiskAdaptor::readDataDropCache(unsigned char* data,
   return rv;
 }
 
+namespace TempSemNS {
+
+  // from https://vorbrodt.blog/2019/02/05/fast-semaphore/
+  class semaphore
+  {
+  public:
+      semaphore(int count) noexcept
+      : m_count(count) { assert(count > -1); }
+  
+      void signal() noexcept
+      {
+          {
+              std::unique_lock<std::mutex> lock(m_mutex);
+              ++m_count;
+          }
+          m_cv.notify_one();
+      }
+  
+      void wait() noexcept
+      {
+          std::unique_lock<std::mutex> lock(m_mutex);
+          m_cv.wait(lock, [&]() { return m_count != 0; });
+          --m_count;
+      }
+  
+  private:
+      int m_count;
+      std::mutex m_mutex;
+      std::condition_variable m_cv;
+  };
+  class fast_semaphore
+  {
+  public:
+      fast_semaphore(int count) noexcept
+      : m_count(count), m_semaphore(0) {}
+  
+      void signal()
+      {
+          std::atomic_thread_fence(std::memory_order_release);
+          int count = m_count.fetch_add(1, std::memory_order_relaxed);
+          if (count < 0)
+              m_semaphore.signal();
+      }
+  
+      void wait()
+      {
+          int count = m_count.fetch_sub(1, std::memory_order_relaxed);
+          if (count < 1)
+              m_semaphore.wait();
+          std::atomic_thread_fence(std::memory_order_acquire);
+      }
+  
+  private:
+      std::atomic<int> m_count;
+      semaphore m_semaphore;
+  };
+}
+using TempSem = TempSemNS::fast_semaphore;
+static TempSem g_tempsem(10); // Max pending thread waiting to write
+static TempSem g_writesem(2); // Max thread to do write operation, 1 or 2 for better sequential
+
 void AbstractSingleDiskAdaptor::writeCache(const WrDiskCacheEntry* entry)
 {
   // MISTY HACK: do WrDiskCacheEntry::deleteDataCells() here
   // MISTY HACK: Change AbstractDiskWriter::writeDataInternal from seek() + write() to pwrite() to avoid race-condition
   // MISTY HACK: possible we can force use mmap
   
+  if (entry->getDataSet().empty()) {
+    return;
+  }
+
+  g_tempsem.wait();
+  
+
   auto &dataSet = const_cast<WrDiskCacheEntry::DataCellSet&>(entry->getDataSet());
   WrDiskCacheEntry::DataCellSet copiedSet(dataSet);
   dataSet.clear();
 
   std::thread{[this, copiedSet] {
   
-  if (copiedSet.empty()) {
-    return;
-  }
-
   auto start_goff = (*copiedSet.begin())->goff;
   A2_LOG_INFO(fmt("Cache async flush start... goff=%" PRId64, start_goff));
 
+  g_writesem.wait();
   for (auto& d : copiedSet) {
     A2_LOG_DEBUG(fmt("Cache async flush goff=%" PRId64 ", len=%lu", d->goff,
                     static_cast<unsigned long>(d->len)));
     writeData(d->data + d->offset, d->len, d->goff);
   }
+  g_writesem.signal();
+
   for (auto& d : copiedSet) {
     delete[] d->data;
     delete d;
   }
 
   A2_LOG_INFO(fmt("Cache async flush finish... goff=%" PRId64, start_goff));
+
+  g_tempsem.signal();
 
   }}.detach();
   
